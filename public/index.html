@@ -210,6 +210,64 @@ let kickProgressJobs=new Map();let kickProgressSeen=new Set();let kickProgressSt
 const SAVE_PREFIX="migsock_config_";
 let participantUsers=[];
 let participantBySocket=Array.from({length:N},()=>[]);
+// Central frontend state: socket events update state first, then the UI is
+// rendered only for the affected/settled portion. This keeps realtime event
+// handling cheap on mobile devices.
+const appState={
+  participants:new Map(),
+  targets:new Map(),
+  kicked:new Set(),
+  participantRenderTimer:null,
+  eventSeq:0,
+  lastEventAt:0
+};
+function stateKey(value){return String(value||"").trim().toLowerCase()}
+function queueParticipantRender(){
+  if(appState.participantRenderTimer)return;
+  const flush=()=>{
+    appState.participantRenderTimer=null;
+    const merged=[...appState.participants.values()];
+    participantUsers=merged;
+    showUsers(merged,false);
+  };
+  if(typeof requestAnimationFrame==="function")appState.participantRenderTimer=requestAnimationFrame(flush);
+  else appState.participantRenderTimer=setTimeout(flush,32);
+}
+function rebuildParticipantState(){
+  appState.participants.clear();
+  for(const list of participantBySocket||[])for(const u of (Array.isArray(list)?list:[])){
+    const value=String(u||"").trim(),key=stateKey(value);
+    if(value&&key&&!confirmedKickedTargets.has(key))appState.participants.set(key,value);
+  }
+}
+function applyParticipantSnapshot(i,users){
+  participantBySocket[i]=Array.isArray(users)?users:[];
+  participantReceived.add(i);
+  rebuildParticipantState();
+  const merged=[...appState.participants.values()];
+  queueParticipantRender();
+  scheduleAutoTarget(merged,autoTargetCycle);
+  return merged;
+}
+function dispatchSocketEvent(m,i){
+  if(!m||typeof m!=="object")return;
+  appState.eventSeq++;
+  appState.lastEventAt=performance.now();
+  updateBalanceFromMessage(i,m);
+  if(m.type==="kick.target.confirmed"){removeConfirmedKickedTarget(m.target_username);return}
+  if(isConfirmedKickEvent(m)){removeConfirmedKickedTarget(kickEventData(m).target);return}
+  if(m.type==="kick.progress"){handleKickProgress(m);return}
+  if(m.type==="proxy.error"){status(i,"PROXY ERROR","error");log(i,"PROXY ERROR: "+(m.data?.message||"unknown"));return}
+  if(isKickEvent(m)){maybeSuicide(m);startCountdownFromKick(m)}
+  if(handleParticipants(m,i))return;
+  if(m.type==="auth.required"){log(i,"RECV auth.required");send(i,{type:"developer.login",username:cred(i).username,password:cred(i).password},true)}
+  else if(m.type==="session.ready"){clients[i].loggedIn=true;clients[i].inRoom=false;status(i,"ONLINE","online");startPing(i);log(i,"LOGIN OK")}
+  else if(m.type==="room.join.result"){const ok=m.ok===true||m.data?.ok===true||m.data?.joined===true||m.success===true;if(ok){clients[i].inRoom=true;log(i,"ENTER ROOM OK");const r=roomEl.value.trim();if(r)send(i,{type:"room.participants",room:r},true)}else log(i,"ENTER ROOM RESULT "+JSON.stringify(m))}
+  else if(m.type==="room.leave.result"){const ok=m.ok===true||m.data?.ok===true||m.data?.left===true||m.success===true;if(ok){clients[i].inRoom=false;log(i,"LEAVE ROOM OK")}else log(i,"LEAVE ROOM RESULT "+JSON.stringify(m))}
+  else if(m.type==="session.replaced"){clients[i].loggedIn=false;clients[i].inRoom=false;stopPing(i);status(i,"REPLACED","error")}
+  else if(m.type==="error"){clients[i].loggedIn=false;clients[i].inRoom=false;stopPing(i);status(i,"ERROR","error");log(i,"API ERROR "+JSON.stringify(m))}
+}
+
 let autoTargetLocked=false;
 let autoTargetTimer=null;
 let autoTargetCycle=0;
@@ -368,42 +426,36 @@ function targetHas(username){
 function removeConfirmedKickedTarget(username){
   username=String(username||"").trim();
   if(!username)return false;
-  const key=username.toLowerCase();
+  const key=stateKey(username);
+  if(!key)return false;
   confirmedKickedTargets.add(key);
+  appState.kicked.add(key);
+  appState.participants.delete(key);
+  appState.targets.delete(key);
 
-  // Remove from TARGET immediately.
+  // Update only affected DOM nodes; do not rebuild the complete USER list.
   [...targetList.querySelectorAll(".target-item")].forEach(row=>{
-    const value=String(row.dataset.username||row.textContent||"").trim().toLowerCase();
+    if(stateKey(row.dataset.username||row.textContent)===key)row.remove();
+  });
+  [...userList.querySelectorAll(".user-item")].forEach(row=>{
+    const value=stateKey(row.dataset.username||row.querySelector("span")?.textContent||row.textContent);
     if(value===key)row.remove();
   });
 
-  // Purge every participant snapshot first. A later WS response must not
-  // resurrect this username.
-  participantUsers=(participantUsers||[]).filter(u=>String(u||"").trim().toLowerCase()!==key);
   if(Array.isArray(participantBySocket)){
     for(let i=0;i<participantBySocket.length;i++){
       const list=Array.isArray(participantBySocket[i])?participantBySocket[i]:[];
-      participantBySocket[i]=list.filter(u=>String(u||"").trim().toLowerCase()!==key);
+      participantBySocket[i]=list.filter(u=>stateKey(u)!==key);
     }
   }
-
-  // Remove every possible USER row, including future/legacy row markup.
-  [...userList.querySelectorAll(".user-item")].forEach(row=>{
-    const value=String(row.dataset.username||row.querySelector("span")?.textContent||row.textContent||"").trim().toLowerCase();
-    if(value===key)row.remove();
-  });
-
-  // Rebuild USER from the cleaned snapshot so the count and empty-state stay
-  // consistent, while TARGET entries are preserved.
-  const cleaned=[...new Map((participantBySocket||[]).flat()
-    .map(x=>String(x||"").trim()).filter(Boolean)
-    .map(u=>[u.toLowerCase(),u])).values()]
-    .filter(u=>!confirmedKickedTargets.has(u.toLowerCase()));
-  participantUsers=cleaned;
-  showUsers(cleaned,false);
-
+  participantUsers=[...appState.participants.values()];
+  userCount.textContent=String(userList.querySelectorAll(".user-item").length);
+  if(!userList.querySelector(".user-item") && participantUsers.length===0){
+    userList.innerHTML="";
+    const e=document.createElement("div");e.className="empty";e.textContent="Tidak ada participant";userList.appendChild(e);
+  }
   updateTargetCount();
-  log(0,`KICKED: ${username} dihapus dari USER dan TARGET; snapshot WS dibersihkan`);
+  log(0,`KICKED: ${username} dihapus dari USER dan TARGET; state tersinkron`);
   return true;
 }
 
@@ -419,6 +471,7 @@ function addTarget(username){
   e.dataset.username=value;
   e.textContent=value;
   targetList.appendChild(e);
+  appState.targets.set(key,value);
   updateTargetCount();
   return true;
 }
@@ -682,6 +735,7 @@ function clearTargets(){
   autoTargetCycle++;
   const restored=[...new Set(participantUsers)].filter(u=>!confirmedKickedTargets.has(String(u).toLowerCase()));
   targetList.innerHTML="";
+  appState.targets.clear();
   autoTargetLocked=false;
   updateTargetCount();
   if(restored.length) showUsers(restored,false); else { userList.innerHTML=""; userCount.textContent="0"; }
@@ -737,6 +791,14 @@ function clearTroopClientState(){
   participantExpected=new Set();
   participantReceived=new Set();
   participantBySocket=Array.from({length:N},()=>[]);
+  appState.participants.clear();
+  appState.targets.clear();
+  appState.kicked.clear();
+  if(appState.participantRenderTimer){
+    if(typeof cancelAnimationFrame==="function")cancelAnimationFrame(appState.participantRenderTimer);
+    else clearTimeout(appState.participantRenderTimer);
+    appState.participantRenderTimer=null;
+  }
   confirmedKickedTargets.clear();
   targetList.innerHTML="";
   userList.innerHTML="";
@@ -843,14 +905,7 @@ function listRoom(){listUser()}
 function handleParticipants(m,i){
   if(m.type!=="room.participants.result"&&m.type!=="room.participants")return false;
   const users=extractUsers(m);
-  participantBySocket[i]=users;
-  participantReceived.add(i);
-  const merged=[...new Map(participantBySocket.flat()
-    .map(x=>String(x||'').trim())
-    .filter(Boolean)
-    .map(u=>[u.toLowerCase(),u])).values()];
-  showUsers(merged,false);
-  scheduleAutoTarget(merged,autoTargetCycle);
+  const merged=applyParticipantSnapshot(i,users);
   log(i,`LISTROOM: WS${i+1} ${users.length} user | gabungan ${merged.length}`);
   return true;
 }
@@ -865,7 +920,12 @@ function loginOne(i){
   const ws=new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`);c.ws=ws;
   const stale=()=>generation!==c.generation||c.ws!==ws;
   ws.onopen=()=>{if(stale()){try{ws.close(1000,"stale")}catch(e){};return}log(i,"Proxy OPEN; menunggu auth.required")};
-  ws.onmessage=e=>{if(stale())return;let m;try{m=JSON.parse(e.data)}catch(_){log(i,"RECV non-JSON");return}updateBalanceFromMessage(i,m);if(m.type==="kick.target.confirmed"){removeConfirmedKickedTarget(m.target_username);return}if(isConfirmedKickEvent(m)){removeConfirmedKickedTarget(kickEventData(m).target);return}if(m.type==="kick.progress"){handleKickProgress(m);return}if(m.type==="proxy.error"){status(i,"PROXY ERROR","error");log(i,"PROXY ERROR: "+(m.data?.message||"unknown"));return}if(isKickEvent(m)){maybeSuicide(m);startCountdownFromKick(m)}if(handleParticipants(m,i))return;if(m.type==="auth.required"){log(i,"RECV auth.required");send(i,{type:"developer.login",username:x.username,password:x.password},true)}else if(m.type==="session.ready"){c.loggedIn=true;c.inRoom=false;status(i,"ONLINE","online");startPing(i);log(i,"LOGIN OK")}else if(m.type==="room.join.result"){const ok=m.ok===true||m.data?.ok===true||m.data?.joined===true||m.success===true;if(ok){c.inRoom=true;log(i,"ENTER ROOM OK");const r=roomEl.value.trim();if(r)send(i,{type:"room.participants",room:r},true)}else log(i,"ENTER ROOM RESULT "+JSON.stringify(m))}else if(m.type==="room.leave.result"){const ok=m.ok===true||m.data?.ok===true||m.data?.left===true||m.success===true;if(ok){c.inRoom=false;log(i,"LEAVE ROOM OK")}else log(i,"LEAVE ROOM RESULT "+JSON.stringify(m))}else if(m.type==="session.replaced"){c.loggedIn=false;c.inRoom=false;stopPing(i);status(i,"REPLACED","error")}else if(m.type==="error"){c.loggedIn=false;c.inRoom=false;stopPing(i);status(i,"ERROR","error");log(i,"API ERROR "+JSON.stringify(m))}};
+  ws.onmessage=e=>{
+    if(stale())return;
+    let m;
+    try{m=JSON.parse(e.data)}catch(_){log(i,"RECV non-JSON");return}
+    dispatchSocketEvent(m,i);
+  };
   ws.onerror=()=>{if(stale())return;status(i,"ERROR","error");log(i,"Local WebSocket proxy error")};
   ws.onclose=e=>{if(stale())return;stopPing(i);c.loggedIn=false;c.inRoom=false;if(!c.intentionalClose)status(i,"CLOSED","offline");log(i,`CLOSED code=${e.code} reason=${e.reason||"-"}`);if(c.ws===ws)c.ws=null};
 };
@@ -994,6 +1054,12 @@ function handleKickProgress(m){
     kickProgressJobs.clear();
     (m.socketReports||[]).forEach(r=>kickProgressJobs.set(String(r.websocket||""),r));
     renderKickSocketReports([...kickProgressJobs.values()],"done");
+  }else if(m.phase==="error"){
+    kickProgressStatus.textContent="ERROR";
+    kickProgressStatus.className="kick-progress-error";
+    if(kickProgressDetail)kickProgressDetail.textContent="Job gagal: "+String(m.error||"unknown error");
+    if(kickFailed)kickFailed.textContent=String(m.error||"error");
+    return;
   }
   const elapsed=Math.max(0.001,(performance.now()-kickProgressStartedAt)/1000);
   const rate=Math.round((done+failed)/elapsed);
