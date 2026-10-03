@@ -541,13 +541,29 @@ async def _run_kick_job(job_id, session_id, room, targets, socket_entries, loops
             "jobId": job_id,
             "sessionId": session_id,
             "targets": list(targets),
+            # Authoritative per-job target state. A target enters ``kicked``
+            # only after the upstream confirmed-kicked event is received.
             "kicked": set(),
+            # Targets already selected for a replacement dispatch.
             "claimed": set(),
             "events": {t.casefold(): asyncio.Event() for t in targets},
             "replacement_tasks": set(),
             "replacement_dispatched": 0,
             "lock": asyncio.Lock(),
         }
+
+        def target_is_kicked(target):
+            key = str(target or "").strip().casefold()
+            return bool(key) and key in replacement_state["kicked"]
+
+        def filter_live_wave(wave):
+            # Keep PatternEngine immutable: BRUTE/COMBO still produces the
+            # exact same waves, but confirmed-kicked targets are removed from
+            # the dispatch set immediately before each wave is scheduled.
+            return [
+                target for target in wave
+                if not target_is_kicked(target)
+            ]
 
         async def dispatch_replacement(kicked_target):
             async with replacement_state["lock"]:
@@ -585,7 +601,9 @@ async def _run_kick_job(job_id, session_id, room, targets, socket_entries, loops
             while current_target:
                 target_key = str(current_target).strip().casefold()
 
-                # Never send another kick to a target already confirmed as kicked.
+                # Final per-dispatch guard. The wave filter above prevents
+                # scheduling confirmed-kicked targets; this second check closes
+                # the normal event->dispatch gap for jobs already created.
                 state = replacement_state
                 async with state["lock"]:
                     if target_key in state["kicked"]:
@@ -626,10 +644,14 @@ async def _run_kick_job(job_id, session_id, room, targets, socket_entries, loops
 
         for loop_no in range(loops):
             for wave_index, wave in enumerate(pattern.waves()):
+                # Re-read the authoritative kicked set for every wave. This is
+                # the synchronization point between Target state and all
+                # BRUTE1..BRUTE10 / COMBO1 / COMBO2 patterns.
+                live_wave = filter_live_wave(wave)
                 jobs = [
                     run_one(ws, ws_name, target, loop_no)
                     for ws_name, ws in socket_entries
-                    for target in wave
+                    for target in live_wave
                 ]
                 if jobs:
                     await asyncio.gather(*jobs, return_exceptions=True)
