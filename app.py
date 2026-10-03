@@ -54,6 +54,8 @@ def require_auth(handler):
 # already been confirmed kicked by an upstream room event.
 ACTIVE_KICK_JOBS = {}
 ACTIVE_KICK_TASKS = {}
+# Actual asyncio tasks, kept separately so LOGOUT ALL can cancel stale jobs.
+ACTIVE_KICK_TASK_HANDLES = {}
 
 def _norm_room_key(room):
     return str(room or "").strip().casefold()
@@ -480,12 +482,17 @@ async def kick_loop(request):
         job_id, session_id, room, list(targets), socket_entries, loops, burst, combo,
         delay_target, delay_batch
     ))
+    ACTIVE_KICK_TASK_HANDLES.setdefault(job_key, {})[job_id] = task
     def _job_done(_task):
         current = ACTIVE_KICK_TASKS.get(job_key, [])
         if job_id in current:
             current.remove(job_id)
         if not current:
             ACTIVE_KICK_TASKS.pop(job_key, None)
+        handles = ACTIVE_KICK_TASK_HANDLES.get(job_key, {})
+        handles.pop(job_id, None)
+        if not handles:
+            ACTIVE_KICK_TASK_HANDLES.pop(job_key, None)
         # A failed worker must not leave a stale job in this user's room.
         active_states = ACTIVE_KICK_JOBS.get(job_key, [])
         if active_states:
@@ -656,6 +663,37 @@ async def _run_kick_job(job_id, session_id, room, targets, socket_entries, loops
             "socketReports": reports
         })
         return None
+
+@require_auth
+async def reset_troop_session(request):
+    """Clear troop-side jobs/state without logging the browser application out."""
+    session_id = request.get("session_id")
+    cancelled = 0
+    # Remove job state first so no late completion event can revive an old job.
+    for job_key in list(ACTIVE_KICK_JOBS.keys()):
+        if job_key[0] == session_id:
+            ACTIVE_KICK_JOBS.pop(job_key, None)
+    for job_key in list(ACTIVE_KICK_TASK_HANDLES.keys()):
+        if job_key[0] != session_id:
+            continue
+        handles = ACTIVE_KICK_TASK_HANDLES.pop(job_key, {})
+        for task in list(handles.values()):
+            if task and not task.done():
+                task.cancel()
+                cancelled += 1
+        ACTIVE_KICK_TASKS.pop(job_key, None)
+    SESSION_SUICIDE_KEYS.pop(session_id, None)
+    # Close every upstream belonging to this troop session so the next LOGIN ALL
+    # always starts with fresh developer sessions.
+    sockets = list((SESSION_UPSTREAM.get(session_id) or {}).values())
+    for ws in sockets:
+        try:
+            if ws is not None and not ws.closed:
+                await ws.close(code=1000, message=b"troop reset")
+        except Exception:
+            pass
+    SESSION_UPSTREAM.pop(session_id, None)
+    return web.json_response({"ok": True, "cancelledJobs": cancelled, "closedSockets": len(sockets), "session": "troop-reset"})
 
 @require_auth
 async def suicide(request):
@@ -948,6 +986,7 @@ app.router.add_get("/health", health)
 app.router.add_get("/ws", proxy)
 app.router.add_post("/api/kick-loop", kick_loop)
 app.router.add_post("/api/sandbox-kick", sandbox_kick)
+app.router.add_post("/api/troop/reset", reset_troop_session)
 app.router.add_post("/api/suicide", suicide)
 app.router.add_static("/static/", ROOT)
 
