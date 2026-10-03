@@ -203,7 +203,7 @@ function switchTab(name){
 tabSetting.onclick=()=>switchTab("setting");
 tabDuel.onclick=()=>switchTab("duel");
 const N=10;
-const clients=Array.from({length:N},()=>({ws:null,loggedIn:false,inRoom:false,pingTimer:null,intentionalClose:false,balance:null}));
+const clients=Array.from({length:N},()=>({ws:null,loggedIn:false,inRoom:false,pingTimer:null,intentionalClose:false,balance:null,generation:0}));
 const rows=document.getElementById("rows"),roomEl=document.getElementById("room"),userList=document.getElementById("userList"),targetList=document.getElementById("targetList"),userCount=document.getElementById("userCount"),targetCount=document.getElementById("targetCount"),saveLoadEl=document.getElementById("saveLoad");
 const kickProgressStatus=document.getElementById("kickProgressStatus"),kickProgressDetail=document.getElementById("kickProgressDetail"),kickDispatched=document.getElementById("kickDispatched"),kickFailed=document.getElementById("kickFailed"),kickWs=document.getElementById("kickWs"),kickRate=document.getElementById("kickRate"),kickSocketReports=document.getElementById("kickSocketReports");
 let kickProgressJobs=new Map();let kickProgressSeen=new Set();let kickProgressStartedAt=0;let confirmedKickedTargets=new Set();
@@ -717,9 +717,41 @@ function setPass(){
 function send(i,o,hideLog=false){const c=clients[i];if(!c.ws||c.ws.readyState!==WebSocket.OPEN){log(i,"Socket belum OPEN");return false}c.ws.send(JSON.stringify(o));if(hideLog)log(i,`SEND ${o.type}`);else log(i,"SEND "+JSON.stringify(o));return true}
 function stopPing(i){if(clients[i].pingTimer){clearInterval(clients[i].pingTimer);clients[i].pingTimer=null}}
 function startPing(i){stopPing(i);clients[i].pingTimer=setInterval(()=>{if(clients[i].loggedIn)send(i,{type:"ping"},true)},40000)}
-function logoutOne(i){const c=clients[i];c.intentionalClose=true;stopPing(i);c.loggedIn=false;c.inRoom=false;c.balance=null;setBalance(i,"—");if(c.ws)try{c.ws.close(1000,"logout")}catch(e){}status(i,"OFFLINE","offline");log(i,"Logout")}
+function logoutOne(i){
+  const c=clients[i];
+  c.generation++;
+  c.intentionalClose=true;
+  stopPing(i);
+  c.loggedIn=false;c.inRoom=false;c.balance=null;
+  setBalance(i,"—");
+  const old=c.ws;c.ws=null;
+  if(old){try{old.close(1000,"logout")}catch(e){}}
+  status(i,"OFFLINE","offline");
+  log(i,"Logout + session WS dibersihkan");
+}
+function clearTroopClientState(){
+  if(autoTargetTimer){clearTimeout(autoTargetTimer);autoTargetTimer=null}
+  autoTargetCycle++;
+  autoTargetLocked=false;
+  participantUsers=[];
+  participantExpected=new Set();
+  participantReceived=new Set();
+  participantBySocket=Array.from({length:N},()=>[]);
+  confirmedKickedTargets.clear();
+  targetList.innerHTML="";
+  userList.innerHTML="";
+  userCount.textContent="0";
+  updateTargetCount();
+  resetKickLive();
+}
 function loginAll(){for(let i=0;i<N;i++){const x=cred(i);if(x.username&&x.password)setTimeout(()=>loginOne(i),i*200)}}
-function logoutAll(){resetKickLive();for(let i=0;i<N;i++)logoutOne(i)}
+async function logoutAll(){
+  clearTroopClientState();
+  const resetPromise=fetch("/api/troop/reset",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}",cache:"no-store"}).catch(()=>null);
+  await Promise.race([resetPromise,new Promise(r=>setTimeout(r,1000))]);
+  for(let i=0;i<N;i++)logoutOne(i);
+  log(0,"LOGOUT ALL: seluruh WS/session troop lama dibersihkan; aplikasi tetap terbuka");
+}
 function enterAll(){const room=getRoom();if(!room)return;for(let i=0;i<N;i++)if(clients[i].loggedIn)send(i,{type:"room.join",room},true)}
 function leaveAll(){const room=getRoom();if(!room)return;resetKickLive();for(let i=0;i<N;i++)if(clients[i].loggedIn)send(i,{type:"room.leave",room},true)}
 function extractUsers(m){
@@ -823,7 +855,20 @@ function handleParticipants(m,i){
   return true;
 }
 // Patch each socket handler to also process room participant results.
-function loginOne(i){const c=clients[i],x=cred(i);if(!x.username||!x.password){log(i,"Username/password kosong");return}c.intentionalClose=false;c.loggedIn=false;c.inRoom=false;c.balance=null;setBalance(i,"—");stopPing(i);if(c.ws)try{c.ws.close()}catch(e){}status(i,"CONNECTING","connecting");log(i,"Connecting local proxy...");const ws=new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`);c.ws=ws;ws.onopen=()=>log(i,"Proxy OPEN; menunggu auth.required");ws.onmessage=e=>{let m;try{m=JSON.parse(e.data)}catch(_){log(i,"RECV non-JSON");return}updateBalanceFromMessage(i,m);if(m.type==="kick.target.confirmed"){removeConfirmedKickedTarget(m.target_username);return}if(isConfirmedKickEvent(m)){removeConfirmedKickedTarget(kickEventData(m).target);return}if(m.type==="kick.progress"){handleKickProgress(m);return}if(m.type==="proxy.error"){status(i,"PROXY ERROR","error");log(i,"PROXY ERROR: "+(m.data?.message||"unknown"));return}if(isKickEvent(m)){maybeSuicide(m);startCountdownFromKick(m)}if(handleParticipants(m,i))return;if(m.type==="auth.required"){log(i,"RECV auth.required");send(i,{type:"developer.login",username:x.username,password:x.password},true)}else if(m.type==="session.ready"){c.loggedIn=true;c.inRoom=false;status(i,"ONLINE","online");startPing(i);log(i,"LOGIN OK")}else if(m.type==="room.join.result"){const ok=m.ok===true||m.data?.ok===true||m.data?.joined===true||m.success===true;if(ok){c.inRoom=true;log(i,"ENTER ROOM OK");const r=roomEl.value.trim();if(r)send(i,{type:"room.participants",room:r},true)}else log(i,"ENTER ROOM RESULT "+JSON.stringify(m))}else if(m.type==="room.leave.result"){const ok=m.ok===true||m.data?.ok===true||m.data?.left===true||m.success===true;if(ok){c.inRoom=false;log(i,"LEAVE ROOM OK")}else log(i,"LEAVE ROOM RESULT "+JSON.stringify(m))}else if(m.type==="session.replaced"){c.loggedIn=false;c.inRoom=false;stopPing(i);status(i,"REPLACED","error")}else if(m.type==="error"){c.loggedIn=false;c.inRoom=false;stopPing(i);status(i,"ERROR","error");log(i,"API ERROR "+JSON.stringify(m))}};ws.onerror=()=>{status(i,"ERROR","error");log(i,"Local WebSocket proxy error")};ws.onclose=e=>{stopPing(i);c.loggedIn=false;c.inRoom=false;if(!c.intentionalClose)status(i,"CLOSED","offline");log(i,`CLOSED code=${e.code} reason=${e.reason||"-"}`)}};
+function loginOne(i){
+  const c=clients[i],x=cred(i);
+  if(!x.username||!x.password){log(i,"Username/password kosong");return}
+  const generation=++c.generation;
+  c.intentionalClose=false;c.loggedIn=false;c.inRoom=false;c.balance=null;setBalance(i,"—");stopPing(i);
+  const previous=c.ws;c.ws=null;if(previous)try{previous.close(1000,"replace")}catch(e){}
+  status(i,"CONNECTING","connecting");log(i,"Connecting local proxy...");
+  const ws=new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`);c.ws=ws;
+  const stale=()=>generation!==c.generation||c.ws!==ws;
+  ws.onopen=()=>{if(stale()){try{ws.close(1000,"stale")}catch(e){};return}log(i,"Proxy OPEN; menunggu auth.required")};
+  ws.onmessage=e=>{if(stale())return;let m;try{m=JSON.parse(e.data)}catch(_){log(i,"RECV non-JSON");return}updateBalanceFromMessage(i,m);if(m.type==="kick.target.confirmed"){removeConfirmedKickedTarget(m.target_username);return}if(isConfirmedKickEvent(m)){removeConfirmedKickedTarget(kickEventData(m).target);return}if(m.type==="kick.progress"){handleKickProgress(m);return}if(m.type==="proxy.error"){status(i,"PROXY ERROR","error");log(i,"PROXY ERROR: "+(m.data?.message||"unknown"));return}if(isKickEvent(m)){maybeSuicide(m);startCountdownFromKick(m)}if(handleParticipants(m,i))return;if(m.type==="auth.required"){log(i,"RECV auth.required");send(i,{type:"developer.login",username:x.username,password:x.password},true)}else if(m.type==="session.ready"){c.loggedIn=true;c.inRoom=false;status(i,"ONLINE","online");startPing(i);log(i,"LOGIN OK")}else if(m.type==="room.join.result"){const ok=m.ok===true||m.data?.ok===true||m.data?.joined===true||m.success===true;if(ok){c.inRoom=true;log(i,"ENTER ROOM OK");const r=roomEl.value.trim();if(r)send(i,{type:"room.participants",room:r},true)}else log(i,"ENTER ROOM RESULT "+JSON.stringify(m))}else if(m.type==="room.leave.result"){const ok=m.ok===true||m.data?.ok===true||m.data?.left===true||m.success===true;if(ok){c.inRoom=false;log(i,"LEAVE ROOM OK")}else log(i,"LEAVE ROOM RESULT "+JSON.stringify(m))}else if(m.type==="session.replaced"){c.loggedIn=false;c.inRoom=false;stopPing(i);status(i,"REPLACED","error")}else if(m.type==="error"){c.loggedIn=false;c.inRoom=false;stopPing(i);status(i,"ERROR","error");log(i,"API ERROR "+JSON.stringify(m))}};
+  ws.onerror=()=>{if(stale())return;status(i,"ERROR","error");log(i,"Local WebSocket proxy error")};
+  ws.onclose=e=>{if(stale())return;stopPing(i);c.loggedIn=false;c.inRoom=false;if(!c.intentionalClose)status(i,"CLOSED","offline");log(i,`CLOSED code=${e.code} reason=${e.reason||"-"}`);if(c.ws===ws)c.ws=null};
+};
 function syncBruteCombo(source){
   const brute=document.getElementById('burstKick');
   const combo=document.getElementById('comboKick');
