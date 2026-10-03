@@ -509,6 +509,34 @@ async def kick_loop(request):
     }, status=202)
 
 async def _run_kick_job(job_id, session_id, room, targets, socket_entries, loops, burst, combo, delay_target, delay_batch):
+    # Keep worker failures observable by the frontend instead of leaving a
+    # permanent RUNNING state. Cancellation is intentionally silent because
+    # LOGOUT/RESET explicitly cancels the worker.
+    try:
+        return await _run_kick_job_impl(
+            job_id, session_id, room, targets, socket_entries, loops, burst, combo,
+            delay_target, delay_batch
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        print(f"[KICK JOB ERROR] job={job_id} session={session_id[:8]} room={room!r}: {exc!r}", flush=True)
+        try:
+            await publish_kick_progress(session_id, {
+                "jobId": job_id,
+                "phase": "error",
+                "error": str(exc),
+                "websockets": len(socket_entries),
+                "targets": len(targets),
+                "loop": loops,
+                "burst": burst,
+                "combo": combo,
+            })
+        except Exception:
+            pass
+        raise
+
+async def _run_kick_job_impl(job_id, session_id, room, targets, socket_entries, loops, burst, combo, delay_target, delay_batch):
         pattern = PatternEngine(targets, burst=burst, combo=combo)
         total_jobs = loops * pattern.jobs_per_socket() * len(socket_entries)
         per_socket_total = loops * pattern.jobs_per_socket()
