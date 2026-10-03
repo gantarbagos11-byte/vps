@@ -7,7 +7,9 @@ from pathlib import Path
 
 DB_PATH = Path(__file__).resolve().parent / "auth.db"
 SESSION_COOKIE = "migsock_session"
-SESSION_TTL = 12 * 60 * 60
+DEFAULT_SESSION_TTL = 12 * 60 * 60
+SESSION_TTL_MIN = 5 * 60
+SESSION_TTL_MAX = 30 * 24 * 60 * 60
 
 # Bootstrap admin requested for this build. Only the salted scrypt hash is stored.
 BOOTSTRAP_ADMIN_USERNAME = "chikovalen"
@@ -35,6 +37,16 @@ def init_auth_db():
                 created_at REAL NOT NULL
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+        conn.execute(
+            "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
+            ("session_ttl_seconds", str(DEFAULT_SESSION_TTL)),
+        )
         row = conn.execute(
             "SELECT username FROM users WHERE username = ? COLLATE NOCASE",
             (BOOTSTRAP_ADMIN_USERNAME,),
@@ -98,6 +110,29 @@ def authenticate(username: str, password: str):
     return {"username": row["username"], "role": row["role"]}
 
 
+def get_session_ttl():
+    try:
+        with _connect() as conn:
+            row = conn.execute("SELECT value FROM settings WHERE key=?", ("session_ttl_seconds",)).fetchone()
+        value = int(row[0]) if row else DEFAULT_SESSION_TTL
+    except Exception:
+        value = DEFAULT_SESSION_TTL
+    return max(SESSION_TTL_MIN, min(SESSION_TTL_MAX, value))
+
+
+def set_session_ttl(seconds: int):
+    seconds = int(seconds)
+    if seconds < SESSION_TTL_MIN or seconds > SESSION_TTL_MAX:
+        raise ValueError("Durasi session harus antara 5 menit dan 30 hari")
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            ("session_ttl_seconds", str(seconds)),
+        )
+        conn.commit()
+    return seconds
+
+
 def _cleanup_sessions():
     now = time.time()
     for token, session in list(SESSIONS.items()):
@@ -111,7 +146,7 @@ def create_session(user):
     SESSIONS[token] = {
         "username": user["username"],
         "role": user["role"],
-        "expires": time.time() + SESSION_TTL,
+        "expires": time.time() + get_session_ttl(),
     }
     return token
 
@@ -132,7 +167,7 @@ def get_session(token):
         SESSIONS.pop(token, None)
         return None
     session["role"] = row["role"]
-    session["expires"] = time.time() + SESSION_TTL
+    session["expires"] = time.time() + get_session_ttl()
     return {"username": session["username"], "role": session["role"]}
 
 

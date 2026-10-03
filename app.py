@@ -10,6 +10,7 @@ from pattern_engine import PatternEngine
 from auth import (
     SESSION_COOKIE, create_session, authenticate, destroy_session, get_session,
     init_auth_db, list_users, create_user, set_enabled, delete_user, change_password,
+    get_session_ttl, set_session_ttl, SESSION_TTL_MIN, SESSION_TTL_MAX,
 )
 
 ROOT = Path(__file__).resolve().parent / "public"
@@ -768,7 +769,7 @@ async def auth_login(request):
     token = create_session(user)
     response = web.json_response({"ok": True, "user": user})
     response.set_cookie(
-        SESSION_COOKIE, token, max_age=12 * 60 * 60, httponly=True,
+        SESSION_COOKIE, token, max_age=get_session_ttl(), httponly=True,
         samesite="Lax", secure=request.scheme == "https", path="/"
     )
     return response
@@ -801,6 +802,26 @@ async def admin_change_password(request):
 @require_admin
 async def admin_users(request):
     return web.json_response({"ok": True, "users": list_users()})
+
+
+@require_admin
+async def admin_session_settings(request):
+    if request.method == "GET":
+        ttl = get_session_ttl()
+        return web.json_response({
+            "ok": True,
+            "seconds": ttl,
+            "minutes": ttl // 60,
+            "minSeconds": SESSION_TTL_MIN,
+            "maxSeconds": SESSION_TTL_MAX,
+        })
+    try:
+        data = await request.json()
+        seconds = int(data.get("seconds"))
+        ttl = set_session_ttl(seconds)
+        return web.json_response({"ok": True, "seconds": ttl, "minutes": ttl // 60})
+    except (TypeError, ValueError):
+        return web.json_response({"ok": False, "error": "Durasi session tidak valid"}, status=400)
 
 
 @require_admin
@@ -978,6 +999,8 @@ app.router.add_post("/api/auth/login", auth_login)
 app.router.add_post("/api/auth/logout", require_auth(auth_logout))
 app.router.add_get("/api/auth/me", auth_me)
 app.router.add_get("/api/admin/users", admin_users)
+app.router.add_get("/api/admin/session-settings", admin_session_settings)
+app.router.add_post("/api/admin/session-settings", admin_session_settings)
 app.router.add_post("/api/admin/password", admin_change_password)
 app.router.add_post("/api/admin/users", admin_create_user)
 app.router.add_post("/api/admin/users/{username}/enabled", admin_set_user_enabled)
